@@ -1,9 +1,9 @@
 import gymnasium as gym
 import numpy as np
 
-EPOCHS = int(2e6)
-GAMMA = 0.95
-LR = 1e-3
+EPOCHS = int(2e5)
+GAMMA = 0.99
+LR = 1e-5
 EPS = 1e-5
 
 
@@ -18,18 +18,18 @@ def relu(x):
 
 
 def discount_Rt(n: int, gamma: float):
-    return np.pow(gamma, np.arange(n))[::-1]
+    return ((1 - np.pow(GAMMA, np.arange(1, n+1))) / (1 - GAMMA))[::-1]
 
 
 def main():
     env = gym.make("CartPole-v1")
 
-    # W1 = np.random.randn(4, 8)
-    # W2 = np.random.randn(8, 1)
+    # W1 = np.random.randn(4, 16)
+    # W2 = np.random.randn(16, 1)
     W1 = np.load("ckpt/w1.npy")
     W2 = np.load("ckpt/w2.npy")
 
-    rets, costs = [], []
+    rets, costs = [1], [1]
 
     for i in range(EPOCHS):
         St, info = env.reset()
@@ -47,6 +47,8 @@ def main():
             a2 = np.clip(sigmoid(z2), EPS, 1-EPS) # clip is not gradient tracked. hopefully doesn't make a difference :p
             p = a2[0, 0]
 
+            S.append(St)
+
             at = np.random.choice([0, 1], p=[p, 1 - p])  # action at timestep t
             St, Rt, term, trunc, info = env.step(at)
             St = St.reshape(1, 4)
@@ -55,7 +57,6 @@ def main():
             A1.append(a1)
             A2.append(a2)
             Z1.append(z1)
-            S.append(St)
 
             tot_ret += Rt
             t += 1
@@ -68,14 +69,16 @@ def main():
             np.array(Z1),
             np.array(S),
         )
-        R = discount_Rt(t, GAMMA)
+        Gt = discount_Rt(t, GAMMA)
+        baseline = np.mean(discount_Rt(np.ceil(np.mean(rets)), GAMMA))  # scuffed baseline
+        R = Gt - baseline
 
-        J = np.sum(R * ((1 - At) * np.log(A2) + At * np.log(1 - A2)))
+        J = -np.sum(R * ((1 - At) * np.log(A2) + At * np.log(1 - A2))) 
         At = At.reshape(t, 1, 1)
         R = R.reshape(t, 1, 1)
 
         dJdJ = 1
-        dJda2 = dJdJ * R * ((1 - At) / A2 - At / (1 - A2))
+        dJda2 = dJdJ * R * -1 * ((1 - At) / A2 - At / (1 - A2))
         dJdz2 = dJda2 * (1 - A2) * A2
 
         dJda1 = dJdz2 @ W2.T
@@ -84,8 +87,8 @@ def main():
         dJdz1 = dJda1 * (Z1 > 0)
         dJdW1 = S.swapaxes(-1, -2) @ dJdz1
 
-        W1 -= LR * dJdW1.sum(axis=0)
-        W2 -= LR * dJdW2.sum(axis=0)
+        W1 -= LR * dJdW1.mean(axis=0)
+        W2 -= LR * dJdW2.mean(axis=0)
 
         costs.append(J)
         rets.append(tot_ret)
