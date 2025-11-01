@@ -4,7 +4,7 @@ import numpy as np
 
 EPOCHS = int(2e5)
 GAMMA = 0.99
-LR = 1e-5
+LR = 5e-4
 EPS = 1e-5
 BETA = 0.90
 SAVE_INTERVAL = 10000
@@ -122,10 +122,8 @@ def main():
         grads, J = policy_backward(A, S, t, rets)
         param_update = rmsprop_update(grads)
 
-        # model["W1"] -= LR * param_update["dJdW1"]
-        # model["W2"] -= LR * param_update["dJdW2"]
-        model["W1"] -= LR * grads["dJdW1"].mean(axis=0)
-        model["W2"] -= LR * grads["dJdW2"].mean(axis=0)
+        model["W1"] -= param_update["dJdW1"]
+        model["W2"] -= param_update["dJdW2"]
 
         grad_buffer.clear()
 
