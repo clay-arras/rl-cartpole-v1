@@ -122,8 +122,10 @@ def main():
         grads, J = policy_backward(A, S, t, rets)
         param_update = rmsprop_update(grads)
 
-        model["W1"] -= LR * param_update["dJdW1"]
-        model["W2"] -= LR * param_update["dJdW2"]
+        # model["W1"] -= LR * param_update["dJdW1"]
+        # model["W2"] -= LR * param_update["dJdW2"]
+        model["W1"] -= LR * grads["dJdW1"].mean(axis=0)
+        model["W2"] -= LR * grads["dJdW2"].mean(axis=0)
 
         grad_buffer.clear()
 
