@@ -2,7 +2,7 @@ import numpy as np
 import gymnasium as gym
 
 
-DISPLAY = False
+DISPLAY = True
 
 
 def sigmoid(x):
@@ -25,7 +25,7 @@ def main():
 
     if DISPLAY == True:
         env = gym.make("CartPole-v1", render_mode="human")
-    else: 
+    else:
         env = gym.make("CartPole-v1")
 
     rets = []
@@ -52,9 +52,9 @@ def main():
 
             tot_ret += Rt
             done = term or trunc
-        
+
         rets.append(tot_ret)
-    
+
     print("avg_ret: ", np.mean(rets))
     env.close()
 

@@ -1,10 +1,25 @@
+from collections import defaultdict
 import gymnasium as gym
 import numpy as np
 
 EPOCHS = int(2e5)
 GAMMA = 0.99
-LR = 1e-5
+LR = 5e-4
 EPS = 1e-5
+BETA = 0.90
+SAVE_INTERVAL = 10000
+
+resume = False
+
+grad_buffer = defaultdict(lambda: [])
+rmsprop_cache = defaultdict(lambda: 0)
+model = {}
+if resume:
+    model["W1"] = np.load("ckpt/w1.npy")
+    model["W2"] = np.load("ckpt/w2.npy")
+else:
+    model["W1"] = np.random.randn(4, 16)
+    model["W2"] = np.random.randn(16, 1)
 
 
 def sigmoid(x):
@@ -18,19 +33,68 @@ def relu(x):
 
 
 def discount_Rt(n: int, gamma: float):
-    return ((1 - np.pow(GAMMA, np.arange(1, n+1))) / (1 - GAMMA))[::-1]
+    return ((1 - np.pow(GAMMA, np.arange(1, n + 1))) / (1 - GAMMA))[::-1]
+
+
+def rmsprop_update(grads):
+    param_update = {}
+    for k, g in grads.items():
+        grad = g.mean(axis=0)
+        rmsprop_cache[k] = BETA * rmsprop_cache[k] + (1 - BETA) * grad**2
+        param_update[k] = (LR / np.sqrt(rmsprop_cache[k] + EPS)) * grad
+    return param_update
+
+
+def policy_forward(St):
+    z1 = St @ model["W1"]
+    a1 = relu(z1)
+    z2 = a1 @ model["W2"]
+    a2 = np.clip(
+        sigmoid(z2), EPS, 1 - EPS
+    )  # clip is not gradient tracked. hopefully doesn't make a difference :p
+    p = a2[0, 0]
+
+    grad_buffer["z1"].append(z1)
+    grad_buffer["a1"].append(a1)
+    grad_buffer["z2"].append(z2)
+    grad_buffer["a2"].append(a2)
+
+    return p
+
+
+def policy_backward(A, S, t, rets):
+    Gt = discount_Rt(t, GAMMA)
+    baseline = np.mean(
+        discount_Rt(np.ceil(np.mean(rets[-SAVE_INTERVAL:])), GAMMA)
+    )  # scuffed baseline
+    R = Gt - baseline
+
+    for k in grad_buffer:
+        grad_buffer[k] = np.array(grad_buffer[k])
+
+    J = -np.sum(
+        R * ((1 - A) * np.log(grad_buffer["a2"]) + A * np.log(1 - grad_buffer["a2"]))
+    )
+    A = A.reshape(t, 1, 1)
+    R = R.reshape(t, 1, 1)
+
+    dJdJ = 1
+    dJda2 = dJdJ * R * -1 * ((1 - A) / grad_buffer["a2"] - A / (1 - grad_buffer["a2"]))
+    dJdz2 = dJda2 * (1 - grad_buffer["a2"]) * grad_buffer["a2"]
+
+    dJda1 = dJdz2 @ model["W2"].T
+    dJdW2 = grad_buffer["a1"].swapaxes(-1, -2) @ dJdz2
+
+    dJdz1 = dJda1 * (grad_buffer["z1"] > 0)
+    dJdW1 = S.swapaxes(-1, -2) @ dJdz1
+
+    return {"dJdW1": dJdW1, "dJdW2": dJdW2}, J
 
 
 def main():
     env = gym.make("CartPole-v1")
 
-    # W1 = np.random.randn(4, 16)
-    # W2 = np.random.randn(16, 1)
-    W1 = np.load("ckpt/w1.npy")
-    W2 = np.load("ckpt/w2.npy")
-
     rets, costs = [1], [1]
-
     for i in range(EPOCHS):
         St, info = env.reset()
         St = St.reshape(1, 4)
@@ -38,69 +102,42 @@ def main():
         done = False
         tot_ret = 0
         t = 0
-        At, A1, A2, Z1, S = [], [], [], [], []
+        A, S = [], []
 
         while not done:
-            z1 = St @ W1
-            a1 = relu(z1)
-            z2 = a1 @ W2
-            a2 = np.clip(sigmoid(z2), EPS, 1-EPS) # clip is not gradient tracked. hopefully doesn't make a difference :p
-            p = a2[0, 0]
-
+            p = policy_forward(St)
             S.append(St)
 
             at = np.random.choice([0, 1], p=[p, 1 - p])  # action at timestep t
             St, Rt, term, trunc, info = env.step(at)
             St = St.reshape(1, 4)
 
-            At.append(at)
-            A1.append(a1)
-            A2.append(a2)
-            Z1.append(z1)
+            A.append(at)
 
             tot_ret += Rt
             t += 1
             done = term or trunc
 
-        At, A1, A2, Z1, S = (
-            np.array(At),
-            np.array(A1),
-            np.array(A2),
-            np.array(Z1),
-            np.array(S),
-        )
-        Gt = discount_Rt(t, GAMMA)
-        baseline = np.mean(discount_Rt(np.ceil(np.mean(rets[-10000:])), GAMMA))  # scuffed baseline
-        R = Gt - baseline
+        A, S = np.array(A), np.array(S)
+        grads, J = policy_backward(A, S, t, rets)
+        param_update = rmsprop_update(grads)
 
-        J = -np.sum(R * ((1 - At) * np.log(A2) + At * np.log(1 - A2))) 
-        At = At.reshape(t, 1, 1)
-        R = R.reshape(t, 1, 1)
+        model["W1"] -= param_update["dJdW1"]
+        model["W2"] -= param_update["dJdW2"]
 
-        dJdJ = 1
-        dJda2 = dJdJ * R * -1 * ((1 - At) / A2 - At / (1 - A2))
-        dJdz2 = dJda2 * (1 - A2) * A2
-
-        dJda1 = dJdz2 @ W2.T
-        dJdW2 = A1.swapaxes(-1, -2) @ dJdz2
-
-        dJdz1 = dJda1 * (Z1 > 0)
-        dJdW1 = S.swapaxes(-1, -2) @ dJdz1
-
-        W1 -= LR * dJdW1.mean(axis=0)
-        W2 -= LR * dJdW2.mean(axis=0)
+        grad_buffer.clear()
 
         costs.append(J)
         rets.append(tot_ret)
-        if i % 10000 == 0:
+        if i % SAVE_INTERVAL == 0:
             print(
                 "cost: ",
-                np.mean(np.array(costs[-10000:])),
+                np.mean(np.array(costs[-SAVE_INTERVAL:])),
                 "avg_ret: ",
-                np.mean(np.array(rets[-10000:])),
+                np.mean(np.array(rets[-SAVE_INTERVAL:])),
             )
-            np.save("ckpt/w1.npy", W1)
-            np.save("ckpt/w2.npy", W2)
+            # np.save("ckpt/w1.npy", model["W1"])
+            # np.save("ckpt/w2.npy", model["W2"])
 
     env.close()
 
