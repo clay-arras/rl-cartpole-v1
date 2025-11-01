@@ -70,7 +70,7 @@ def main():
             np.array(S),
         )
         Gt = discount_Rt(t, GAMMA)
-        baseline = np.mean(discount_Rt(np.ceil(np.mean(rets)), GAMMA))  # scuffed baseline
+        baseline = np.mean(discount_Rt(np.ceil(np.mean(rets[-10000:])), GAMMA))  # scuffed baseline
         R = Gt - baseline
 
         J = -np.sum(R * ((1 - At) * np.log(A2) + At * np.log(1 - A2))) 
