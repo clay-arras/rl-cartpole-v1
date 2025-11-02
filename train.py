@@ -9,7 +9,12 @@ EPS = 1e-5
 BETA = 0.90
 SAVE_INTERVAL = 10000
 
+env = gym.make("CartPole-v1")
 resume = False
+
+NUM_OBS = env.observation_space.shape[0]
+NUM_ACT = env.action_space.n
+HIDDEN_LAYER = 16
 
 grad_buffer = defaultdict(lambda: [])
 rmsprop_cache = defaultdict(lambda: 0)
@@ -18,12 +23,17 @@ if resume:
     model["W1"] = np.load("ckpt/w1.npy")
     model["W2"] = np.load("ckpt/w2.npy")
 else:
-    model["W1"] = np.random.randn(4, 16)
-    model["W2"] = np.random.randn(16, 1)
+    model["W1"] = np.random.randn(NUM_OBS, HIDDEN_LAYER)
+    model["W2"] = np.random.randn(HIDDEN_LAYER, NUM_ACT)
 
 
 def sigmoid(x):
     return 1 / (1 + np.exp(-x))
+
+
+def softmax(x):
+    z = np.max(x, axis=1, keepdims=True)
+    return np.exp(x - z) / np.sum(np.exp(x - z), axis=1, keepdims=True)
 
 
 def relu(x):
@@ -46,20 +56,21 @@ def rmsprop_update(grads):
 
 
 def policy_forward(St):
+    assert St.shape == (1, NUM_OBS)
     z1 = St @ model["W1"]
     a1 = relu(z1)
     z2 = a1 @ model["W2"]
     a2 = np.clip(
-        sigmoid(z2), EPS, 1 - EPS
+        softmax(z2), EPS, 1 - EPS
     )  # clip is not gradient tracked. hopefully doesn't make a difference :p
-    p = a2[0, 0]
 
     grad_buffer["z1"].append(z1)
     grad_buffer["a1"].append(a1)
     grad_buffer["z2"].append(z2)
     grad_buffer["a2"].append(a2)
 
-    return p
+    assert a2.shape == (1, NUM_ACT)
+    return a2[0]
 
 
 def policy_backward(A, S, t, rets):
@@ -72,19 +83,18 @@ def policy_backward(A, S, t, rets):
     for k in grad_buffer:
         grad_buffer[k] = np.array(grad_buffer[k])
 
-    J = -np.sum(
-        R * ((1 - A) * np.log(grad_buffer["a2"]) + A * np.log(1 - grad_buffer["a2"]))
-    )
-    A = A.reshape(t, 1, 1)
+    oh_A = np.zeros((t, NUM_ACT))
+    oh_A[np.arange(t), A] = 1
+
     R = R.reshape(t, 1, 1)
+    oh_A = oh_A.reshape(t, 1, NUM_ACT)
 
-    dJdJ = 1
-    dJda2 = dJdJ * R * -1 * ((1 - A) / grad_buffer["a2"] - A / (1 - grad_buffer["a2"]))
-    dJdz2 = dJda2 * (1 - grad_buffer["a2"]) * grad_buffer["a2"]
+    J = -np.sum(R * oh_A * np.log(grad_buffer["a2"]))
 
-    dJda1 = dJdz2 @ model["W2"].T
+    dJdz2 = R * (grad_buffer["a2"] - oh_A)
     dJdW2 = grad_buffer["a1"].swapaxes(-1, -2) @ dJdz2
 
+    dJda1 = dJdz2 @ model["W2"].T
     dJdz1 = dJda1 * (grad_buffer["z1"] > 0)
     dJdW1 = S.swapaxes(-1, -2) @ dJdz1
 
@@ -92,12 +102,10 @@ def policy_backward(A, S, t, rets):
 
 
 def main():
-    env = gym.make("CartPole-v1")
-
     rets, costs = [1], [1]
     for i in range(EPOCHS):
         St, info = env.reset()
-        St = St.reshape(1, 4)
+        St = St.reshape(1, NUM_OBS)
 
         done = False
         tot_ret = 0
@@ -108,9 +116,11 @@ def main():
             p = policy_forward(St)
             S.append(St)
 
-            at = np.random.choice([0, 1], p=[p, 1 - p])  # action at timestep t
+            at = np.random.choice(
+                [a for a in range(NUM_ACT)], p=p
+            )  # action at timestep t
             St, Rt, term, trunc, info = env.step(at)
-            St = St.reshape(1, 4)
+            St = St.reshape(1, NUM_OBS)
 
             A.append(at)
 
