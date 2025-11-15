@@ -7,24 +7,26 @@ GAMMA = 0.99
 LR = 5e-4
 EPS = 1e-5
 BETA = 0.90
-SAVE_INTERVAL = 10000
+SAVE_INTERVAL = 5000
 
-env = gym.make("CartPole-v1")
+env = gym.make("LunarLander-v3", continuous=False)
 resume = False
 
 NUM_OBS = env.observation_space.shape[0]
 NUM_ACT = env.action_space.n
-HIDDEN_LAYER = 16
+HIDDEN_LAYER = 128
 
 grad_buffer = defaultdict(lambda: [])
 rmsprop_cache = defaultdict(lambda: 0)
 model = {}
 if resume:
-    model["W1"] = np.load("ckpt/w1.npy")
-    model["W2"] = np.load("ckpt/w2.npy")
+    model["W1"] = np.load("ckpt/w1_lunar.npy")
+    model["W2"] = np.load("ckpt/w2_lunar.npy")
 else:
-    model["W1"] = np.random.randn(NUM_OBS, HIDDEN_LAYER)
-    model["W2"] = np.random.randn(HIDDEN_LAYER, NUM_ACT)
+    model["W1"] = np.random.randn(NUM_OBS, HIDDEN_LAYER) / np.sqrt(
+        NUM_OBS
+    )  # he initialization
+    model["W2"] = np.random.randn(HIDDEN_LAYER, NUM_ACT) / np.sqrt(HIDDEN_LAYER)
 
 
 def sigmoid(x):
@@ -42,8 +44,17 @@ def relu(x):
     return a
 
 
-def discount_Rt(n: int, gamma: float):
-    return ((1 - np.pow(GAMMA, np.arange(1, n + 1))) / (1 - GAMMA))[::-1]
+# def discount_Rt(n: int):
+#     return ((1 - np.pow(GAMMA, np.arange(1, n + 1))) / (1 - GAMMA))[::-1]
+
+
+def discount_Rt(rews):  # rews is (t, )
+    t = rews.shape[-1]
+    Gs = np.zeros(rews.shape)
+    Gs[-1] = rews[-1]
+    for i in range(t - 2, -1, -1):
+        Gs[i] = rews[i] + GAMMA * Gs[i + 1]
+    return Gs
 
 
 def rmsprop_update(grads):
@@ -60,9 +71,7 @@ def policy_forward(St):
     z1 = St @ model["W1"]
     a1 = relu(z1)
     z2 = a1 @ model["W2"]
-    a2 = np.clip(
-        softmax(z2), EPS, 1 - EPS
-    )  # clip is not gradient tracked. hopefully doesn't make a difference :p
+    a2 = softmax(z2)
 
     grad_buffer["z1"].append(z1)
     grad_buffer["a1"].append(a1)
@@ -73,11 +82,9 @@ def policy_forward(St):
     return a2[0]
 
 
-def policy_backward(A, S, t, rets):
-    Gt = discount_Rt(t, GAMMA)
-    baseline = np.mean(
-        discount_Rt(np.ceil(np.mean(rets[-SAVE_INTERVAL:])), GAMMA)
-    )  # scuffed baseline
+def policy_backward(A, S, R, t, rets):
+    Gt = discount_Rt(R)
+    baseline = np.mean(rets)
     R = Gt - baseline
 
     for k in grad_buffer:
@@ -89,7 +96,7 @@ def policy_backward(A, S, t, rets):
     R = R.reshape(t, 1, 1)
     oh_A = oh_A.reshape(t, 1, NUM_ACT)
 
-    J = -np.sum(R * oh_A * np.log(grad_buffer["a2"]))
+    J = -np.sum(R * oh_A * np.log(grad_buffer["a2"] + EPS))
 
     dJdz2 = R * (grad_buffer["a2"] - oh_A)
     dJdW2 = grad_buffer["a1"].swapaxes(-1, -2) @ dJdz2
@@ -108,9 +115,8 @@ def main():
         St = St.reshape(1, NUM_OBS)
 
         done = False
-        tot_ret = 0
         t = 0
-        A, S = [], []
+        A, S, R = [], [], []
 
         while not done:
             p = policy_forward(St)
@@ -123,13 +129,13 @@ def main():
             St = St.reshape(1, NUM_OBS)
 
             A.append(at)
+            R.append(Rt)
 
-            tot_ret += Rt
             t += 1
             done = term or trunc
 
-        A, S = np.array(A), np.array(S)
-        grads, J = policy_backward(A, S, t, rets)
+        A, S, R = np.array(A), np.array(S), np.array(R)
+        grads, J = policy_backward(A, S, R, t, rets)
         param_update = rmsprop_update(grads)
 
         model["W1"] -= param_update["dJdW1"]
@@ -138,7 +144,7 @@ def main():
         grad_buffer.clear()
 
         costs.append(J)
-        rets.append(tot_ret)
+        rets.append(np.sum(R))
         if i % SAVE_INTERVAL == 0:
             print(
                 "cost: ",
@@ -146,8 +152,8 @@ def main():
                 "avg_ret: ",
                 np.mean(np.array(rets[-SAVE_INTERVAL:])),
             )
-            # np.save("ckpt/w1.npy", model["W1"])
-            # np.save("ckpt/w2.npy", model["W2"])
+            np.save("ckpt/w1_lunar.npy", model["W1"])
+            np.save("ckpt/w2_lunar.npy", model["W2"])
 
     env.close()
 
