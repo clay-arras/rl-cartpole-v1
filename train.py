@@ -1,43 +1,11 @@
 from collections import defaultdict
 import gymnasium as gym
-import jax.numpy as np
-import jax
-
-EPOCHS = int(2e5)
-GAMMA = 0.99
-LR = 5e-4
-EPS = 1e-5
-BETA = 0.90
-SAVE_INTERVAL = 5000
-
-seed = 42
-key = jax.random.key(seed)
-
-env = gym.make("CartPole-v1")
-resume = False
-
-NUM_OBS = env.observation_space.shape[0]
-NUM_ACT = env.action_space.n
-HIDDEN_LAYER = 128
-
-grad_buffer = defaultdict(lambda: [])
-rmsprop_cache = defaultdict(lambda: 0)
-model = {}
-if resume:
-    model["W1"] = np.load("ckpt/w1_lunar.npy")
-    model["W2"] = np.load("ckpt/w2_lunar.npy")
-else:
-    model["W1"] = jax.random.uniform(key, (NUM_OBS, HIDDEN_LAYER)) / np.sqrt(
-        NUM_OBS
-    )  # he initialization
-    model["W2"] = jax.random.uniform(key, (HIDDEN_LAYER, NUM_ACT)) / np.sqrt(HIDDEN_LAYER)
+import autograd.numpy as np
+# import jax.numpy as np
+# import jax
 
 
-def sigmoid(x): # PURE
-    return 1 / (1 + np.exp(-x))
-
-
-def softmax(x): # PURE
+def softmax(x): 
     z = np.max(x, axis=1, keepdims=True)
     return np.exp(x - z) / np.sum(np.exp(x - z), axis=1, keepdims=True)
 
@@ -47,9 +15,9 @@ def relu(x): # PURE
     return a
 
 
-def discount_Rt(rewards):  # rews is (t, )
+def discount_Rt(rewards, gamma):  # rews is (t, )
     """
-    np.outer(np.pow(GAMMA, pows), np.pow(GAMMA, -pows)) produces the following for t=3
+    np.outer(np.pow(gamma, pows), np.pow(gamma, -pows)) produces the following for t=3
     [[  1, y^-1, y^-2]
      [  y,    1, y^-1]
      [y^2,    y,    1]]
@@ -58,22 +26,24 @@ def discount_Rt(rewards):  # rews is (t, )
     """
     t = rewards.shape[-1]
     pows = np.arange(t)
-    mask = np.outer(np.pow(GAMMA, pows), np.pow(GAMMA, -pows)) * np.tri(t)
+    mask = np.outer(np.pow(gamma, pows), np.pow(gamma, -pows)) * np.tri(t)
 
     return rewards.reshape(1, t) @ mask
 
 
-def rmsprop_update(grads):
+def rmsprop_update(grads, rmsprop_cache, beta, lr, eps):
     param_update = {}
+    updated_cache = {}
     for k, g in grads.items():
         grad = g.mean(axis=0)
-        rmsprop_cache[k] = BETA * rmsprop_cache[k] + (1 - BETA) * grad**2
-        param_update[k] = (LR / np.sqrt(rmsprop_cache[k] + EPS)) * grad
-    return param_update
+        updated_cache[k] = beta * rmsprop_cache[k] + (1 - beta) * grad**2
+        param_update[k] = (lr / np.sqrt(updated_cache[k] + eps)) * grad
+    return param_update, updated_cache
 
 
-def policy_forward(St):
-    assert St.shape == (1, NUM_OBS)
+# @jax.jit
+def policy_forward(St, model, grad_buffer, num_obs, num_act):
+#    assert St.shape == (1, num_obs)
     z1 = St @ model["W1"]
     a1 = relu(z1)
     z2 = a1 @ model["W2"]
@@ -84,24 +54,24 @@ def policy_forward(St):
     grad_buffer["z2"].append(z2)
     grad_buffer["a2"].append(a2)
 
-    assert a2.shape == (1, NUM_ACT)
-    return a2[0]
+    # assert a2.shape == (1, num_act)
+    return a2[0], grad_buffer
 
 
-def policy_backward(A, S, R, t, rets):
-    Gt = discount_Rt(R)
+def policy_backward(A, S, R, t, rets, grad_buffer, model, gamma, eps, num_act):
+    Gt = discount_Rt(R, gamma)
     baseline = np.mean(np.array(rets))
     R = Gt - baseline
 
     for k in grad_buffer:
         grad_buffer[k] = np.array(grad_buffer[k])
 
-    oh_A = np.expand_dims(A, axis=1) == np.expand_dims(np.arange(NUM_ACT), axis=0)
+    oh_A = np.expand_dims(A, axis=1) == np.expand_dims(np.arange(num_act), axis=0)
 
     R = R.reshape(t, 1, 1)
-    oh_A = oh_A.reshape(t, 1, NUM_ACT)
+    oh_A = oh_A.reshape(t, 1, num_act)
 
-    J = -np.sum(R * oh_A * np.log(grad_buffer["a2"] + EPS))
+    J = -np.sum(R * oh_A * np.log(grad_buffer["a2"] + eps))
 
     dJdz2 = R * (grad_buffer["a2"] - oh_A)
     dJdW2 = grad_buffer["a1"].swapaxes(-1, -2) @ dJdz2
@@ -114,24 +84,55 @@ def policy_backward(A, S, R, t, rets):
 
 
 def main():
+    epochs = int(100)
+    gamma = 0.99
+    lr = 5e-4
+    eps = 1e-5
+    beta = 0.90
+    save_interval = 500
+    
+    seed = 42
+    # key = jax.random.key(seed)
+    
+    env = gym.make("CartPole-v1")
+    resume = False
+    
+    num_obs = env.observation_space.shape[0]
+    num_act = env.action_space.n
+    hidden_layer = 128
+    
+    grad_buffer = defaultdict(lambda: [])
+    rmsprop_cache = defaultdict(lambda: 0)
+    model = {}
+    if resume:
+        model["W1"] = np.load("ckpt/w1_lunar.npy")
+        model["W2"] = np.load("ckpt/w2_lunar.npy")
+    else:
+        # model["W1"] = jax.random.uniform(key, (num_obs, hidden_layer)) / np.sqrt(
+        #     num_obs
+        # )  # he initialization
+        # model["W2"] = jax.random.uniform(key, (hidden_layer, num_act)) / np.sqrt(hidden_layer)
+        model["W1"] = np.random.rand(num_obs, hidden_layer) / np.sqrt(
+            num_obs
+        )  # he initialization
+        model["W2"] = np.random.rand(hidden_layer, num_act) / np.sqrt(hidden_layer)
+    
     rets, costs = [1], [1]
-    for i in range(EPOCHS):
+    for i in range(epochs):
         St, _ = env.reset()
-        St = St.reshape(1, NUM_OBS)
+        St = St.reshape(1, num_obs)
 
         done = False
         t = 0
         A, S, R = [], [], []
 
         while not done:
-            p = policy_forward(St)
+            p, grad_buffer = policy_forward(St, model, grad_buffer, num_obs, num_act)
             S.append(St)
 
-            at = jax.random.choice(key,
-                a=np.arange(NUM_ACT), p=p
-            )  # action at timestep t
+            at = np.random.choice(a=np.arange(num_act), p=p)  # action at timestep t
             St, Rt, term, trunc, _ = env.step(at.tolist())
-            St = St.reshape(1, NUM_OBS)
+            St = St.reshape(1, num_obs)
 
             A.append(at)
             R.append(Rt)
@@ -140,25 +141,23 @@ def main():
             done = term or trunc
 
         A, S, R = np.array(A), np.array(S), np.array(R)
-        grads, J = policy_backward(A, S, R, t, rets)
-        param_update = rmsprop_update(grads)
+        grads, J = policy_backward(A, S, R, t, rets, grad_buffer, model, gamma, eps, num_act)
+        param_update, rmsprop_cache = rmsprop_update(grads, rmsprop_cache, beta, lr, eps)
 
         model["W1"] -= param_update["dJdW1"]
         model["W2"] -= param_update["dJdW2"]
 
         grad_buffer.clear()
 
-        if i % 500 == 0:
-            print(i)
         costs.append(J)
         rets.append(np.sum(R))
 
-        if i % SAVE_INTERVAL == 0:
+        if i % save_interval == 0:
             print(
                 "cost: ",
-                np.mean(np.array(costs[-SAVE_INTERVAL:])),
+                np.mean(np.array(costs[-save_interval:])),
                 "avg_ret: ",
-                np.mean(np.array(rets[-SAVE_INTERVAL:])),
+                np.mean(np.array(rets[-save_interval:])),
             )
             # np.save("ckpt/w1_lunar.npy", model["W1"])
             # np.save("ckpt/w2_lunar.npy", model["W2"])

@@ -2,7 +2,7 @@ from collections import defaultdict
 import gymnasium as gym
 import numpy as np
 
-EPOCHS = int(2e5)
+EPOCHS = int(100)
 GAMMA = 0.99
 LR = 5e-4
 EPS = 1e-5
