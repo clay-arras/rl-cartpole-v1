@@ -1,7 +1,6 @@
 from collections import defaultdict
 import gymnasium as gym
-import jax.numpy as np
-import jax
+import numpy as np
 
 EPOCHS = int(2e5)
 GAMMA = 0.99
@@ -10,10 +9,7 @@ EPS = 1e-5
 BETA = 0.90
 SAVE_INTERVAL = 5000
 
-seed = 42
-key = jax.random.key(seed)
-
-env = gym.make("CartPole-v1")
+env = gym.make("LunarLander-v3", continuous=False)
 resume = False
 
 NUM_OBS = env.observation_space.shape[0]
@@ -27,40 +23,38 @@ if resume:
     model["W1"] = np.load("ckpt/w1_lunar.npy")
     model["W2"] = np.load("ckpt/w2_lunar.npy")
 else:
-    model["W1"] = jax.random.uniform(key, (NUM_OBS, HIDDEN_LAYER)) / np.sqrt(
+    model["W1"] = np.random.randn(NUM_OBS, HIDDEN_LAYER) / np.sqrt(
         NUM_OBS
     )  # he initialization
-    model["W2"] = jax.random.uniform(key, (HIDDEN_LAYER, NUM_ACT)) / np.sqrt(HIDDEN_LAYER)
+    model["W2"] = np.random.randn(HIDDEN_LAYER, NUM_ACT) / np.sqrt(HIDDEN_LAYER)
 
 
-def sigmoid(x): # PURE
+def sigmoid(x):
     return 1 / (1 + np.exp(-x))
 
 
-def softmax(x): # PURE
+def softmax(x):
     z = np.max(x, axis=1, keepdims=True)
     return np.exp(x - z) / np.sum(np.exp(x - z), axis=1, keepdims=True)
 
 
-def relu(x): # PURE
-    a = np.maximum(x, 0)
+def relu(x):
+    a = x.copy()
+    a[a < 0] = 0
     return a
 
 
-def discount_Rt(rewards):  # rews is (t, )
-    """
-    np.outer(np.pow(GAMMA, pows), np.pow(GAMMA, -pows)) produces the following for t=3
-    [[  1, y^-1, y^-2]
-     [  y,    1, y^-1]
-     [y^2,    y,    1]]
+# def discount_Rt(n: int):
+#     return ((1 - np.pow(GAMMA, np.arange(1, n + 1))) / (1 - GAMMA))[::-1]
 
-    we mask it and then matmul for discounted cumsum
-    """
-    t = rewards.shape[-1]
-    pows = np.arange(t)
-    mask = np.outer(np.pow(GAMMA, pows), np.pow(GAMMA, -pows)) * np.tri(t)
 
-    return rewards.reshape(1, t) @ mask
+def discount_Rt(rews):  # rews is (t, )
+    t = rews.shape[-1]
+    Gs = np.zeros(rews.shape)
+    Gs[-1] = rews[-1]
+    for i in range(t - 2, -1, -1):
+        Gs[i] = rews[i] + GAMMA * Gs[i + 1]
+    return Gs
 
 
 def rmsprop_update(grads):
@@ -90,13 +84,14 @@ def policy_forward(St):
 
 def policy_backward(A, S, R, t, rets):
     Gt = discount_Rt(R)
-    baseline = np.mean(np.array(rets))
+    baseline = np.mean(rets)
     R = Gt - baseline
 
     for k in grad_buffer:
         grad_buffer[k] = np.array(grad_buffer[k])
 
-    oh_A = np.expand_dims(A, axis=1) == np.expand_dims(np.arange(NUM_ACT), axis=0)
+    oh_A = np.zeros((t, NUM_ACT))
+    oh_A[np.arange(t), A] = 1
 
     R = R.reshape(t, 1, 1)
     oh_A = oh_A.reshape(t, 1, NUM_ACT)
@@ -116,7 +111,7 @@ def policy_backward(A, S, R, t, rets):
 def main():
     rets, costs = [1], [1]
     for i in range(EPOCHS):
-        St, _ = env.reset()
+        St, info = env.reset()
         St = St.reshape(1, NUM_OBS)
 
         done = False
@@ -127,10 +122,10 @@ def main():
             p = policy_forward(St)
             S.append(St)
 
-            at = jax.random.choice(key,
-                a=np.arange(NUM_ACT), p=p
+            at = np.random.choice(
+                [a for a in range(NUM_ACT)], p=p
             )  # action at timestep t
-            St, Rt, term, trunc, _ = env.step(at.tolist())
+            St, Rt, term, trunc, info = env.step(at)
             St = St.reshape(1, NUM_OBS)
 
             A.append(at)
@@ -152,7 +147,6 @@ def main():
             print(i)
         costs.append(J)
         rets.append(np.sum(R))
-
         if i % SAVE_INTERVAL == 0:
             print(
                 "cost: ",
@@ -160,8 +154,8 @@ def main():
                 "avg_ret: ",
                 np.mean(np.array(rets[-SAVE_INTERVAL:])),
             )
-            # np.save("ckpt/w1_lunar.npy", model["W1"])
-            # np.save("ckpt/w2_lunar.npy", model["W2"])
+            np.save("ckpt/w1_lunar.npy", model["W1"])
+            np.save("ckpt/w2_lunar.npy", model["W2"])
 
     env.close()
 
