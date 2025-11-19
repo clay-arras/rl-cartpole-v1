@@ -1,6 +1,7 @@
 from collections import defaultdict
 import gymnasium as gym
 import numpy as np
+
 # import jax.numpy as np
 
 EPOCHS = 100
