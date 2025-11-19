@@ -1,6 +1,7 @@
 from collections import defaultdict
 import gymnasium as gym
-import numpy as np
+import autograd.numpy as np
+from autograd import grad
 
 EPOCHS = int(2e5)
 GAMMA = 0.99
@@ -37,16 +38,14 @@ def softmax(x):
 
 
 def relu(x):
+    # a = x.copy()
+    # a[a < 0] = 0
     a = np.maximum(x, 0)
     return a
 
 
-def discount_Rt(rewards):
-    t = rewards.shape[-1]
-    pows = np.arange(t)
-    mask = np.outer(np.pow(GAMMA, pows), np.pow(GAMMA, -pows)) * np.tri(t)
-
-    return rewards.reshape(1, t) @ mask
+def discount_Rt(n: int, gamma: float):
+    return ((1 - np.pow(GAMMA, np.arange(1, n + 1))) / (1 - GAMMA))[::-1]
 
 
 def rmsprop_update(grads):
@@ -63,7 +62,9 @@ def policy_forward(St):
     z1 = St @ model["W1"]
     a1 = relu(z1)
     z2 = a1 @ model["W2"]
-    a2 = softmax(z2)
+    a2 = np.clip(
+        softmax(z2), EPS, 1 - EPS
+    )  # clip is not gradient tracked. hopefully doesn't make a difference :p
 
     grad_buffer["z1"].append(z1)
     grad_buffer["a1"].append(a1)
@@ -74,28 +75,38 @@ def policy_forward(St):
     return a2[0]
 
 
-def policy_backward(A, S, R, t, rets):
-    Gt = discount_Rt(R)
-    baseline = np.mean(np.array(rets))
+def policy_backward(model, A, oh_A, S, t, rets):
+    S = S.reshape(t, NUM_OBS)
+    z1 = S @ model["W1"]
+    a1 = relu(z1)
+    z2 = a1 @ model["W2"]
+    a2 = softmax(z2)
+
+    Gt = discount_Rt(t, GAMMA)
+    baseline = np.mean(
+        discount_Rt(np.ceil(np.mean(rets[-SAVE_INTERVAL:])), GAMMA)
+    )  # scuffed baseline
     R = Gt - baseline
 
-    for k in grad_buffer:
-        grad_buffer[k] = np.array(grad_buffer[k])
 
-    oh_A = np.expand_dims(A, axis=1) == np.expand_dims(np.arange(NUM_ACT), axis=0)
-    oh_A = oh_A.reshape(t, 1, NUM_ACT)
+    # for k in grad_buffer:
+    #     grad_buffer[k] = np.array(grad_buffer[k])
+
     R = R.reshape(t, 1, 1)
+    oh_A = oh_A.reshape(t, 1, NUM_ACT)
+    a2 = a2.reshape(t, 1, NUM_ACT)
 
-    J = -np.sum(R * oh_A * np.log(grad_buffer["a2"] + EPS))
+    J = -np.sum(R * oh_A * np.log(a2 + 1e-8))
 
-    dJdz2 = R * (grad_buffer["a2"] - oh_A)
-    dJdW2 = grad_buffer["a1"].swapaxes(-1, -2) @ dJdz2
+    # dJdz2 = R * (grad_buffer["a2"] - oh_A)
+    # dJdW2 = grad_buffer["a1"].swapaxes(-1, -2) @ dJdz2
 
-    dJda1 = dJdz2 @ model["W2"].T
-    dJdz1 = dJda1 * (grad_buffer["z1"] > 0)
-    dJdW1 = S.swapaxes(-1, -2) @ dJdz1
+    # dJda1 = dJdz2 @ model["W2"].T
+    # dJdz1 = dJda1 * (grad_buffer["z1"] > 0)
+    # dJdW1 = S.swapaxes(-1, -2) @ dJdz1
 
-    return {"dJdW1": dJdW1, "dJdW2": dJdW2}, J
+    # return {"dJdW1": dJdW1, "dJdW2": dJdW2}, J
+    return J
 
 
 def main():
@@ -105,34 +116,43 @@ def main():
         St = St.reshape(1, NUM_OBS)
 
         done = False
+        tot_ret = 0
         t = 0
-        A, S, R = [], [], []
+        A, S = [], []
 
         while not done:
             p = policy_forward(St)
             S.append(St)
 
-            At = np.random.choice([a for a in range(NUM_ACT)], p=p)
-            St, Rt, term, trunc, info = env.step(At)
+            at = np.random.choice(
+                [a for a in range(NUM_ACT)], p=p
+            )  # action at timestep t
+            St, Rt, term, trunc, info = env.step(at)
             St = St.reshape(1, NUM_OBS)
 
-            A.append(At)
-            R.append(Rt)
+            A.append(at)
 
+            tot_ret += Rt
             t += 1
             done = term or trunc
 
-        A, S, R = np.array(A), np.array(S), np.array(R)
-        grads, J = policy_backward(A, S, R, t, rets)
+        A, S = np.array(A), np.array(S)
+        # grads, J = policy_backward(A, S, t, rets)
+
+        oh_A = np.zeros((t, NUM_ACT))
+        oh_A[np.arange(t), A] = 1
+
+        J = policy_backward(model, A, oh_A, S, t, rets)
+        grads = grad(policy_backward)(model, A, oh_A, S, t, rets)
+
         param_update = rmsprop_update(grads)
 
-        model["W1"] -= param_update["dJdW1"]
-        model["W2"] -= param_update["dJdW2"]
-
+        model["W1"] -= param_update["W1"]
+        model["W2"] -= param_update["W2"]
         grad_buffer.clear()
 
         costs.append(J)
-        rets.append(np.sum(R))
+        rets.append(tot_ret)
         if i % SAVE_INTERVAL == 0:
             print(
                 "cost: ",
