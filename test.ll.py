@@ -1,9 +1,10 @@
 from collections import defaultdict
 import gymnasium as gym
 import numpy as np
+# import jax.numpy as np
 
 EPOCHS = 100
-DISPLAY = False
+DISPLAY = True
 
 if DISPLAY == True:
     env = gym.make("LunarLander-v3", continuous=False, render_mode="human")
