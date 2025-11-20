@@ -7,7 +7,6 @@ EPOCHS = int(2e5)
 GAMMA = 0.99
 LR = 5e-4
 EPS = 1e-5
-BETA = 0.90
 SAVE_INTERVAL = 500
 
 env = gym.make("CartPole-v1")
@@ -17,24 +16,22 @@ NUM_OBS = np.prod(env.observation_space.shape)
 NUM_ACT = env.action_space.n
 HIDDEN_LAYER = 16
 
-rmsprop_cache = defaultdict(lambda: 0)
-model = {}
-if resume:
-    model["W1"] = torch.load("ckpt/w1.pt")
-    model["W2"] = torch.load("ckpt/w2.pt")
-else:
-    model["W1"] = torch.randn(NUM_OBS, HIDDEN_LAYER, requires_grad=True)
-    model["W2"] = torch.randn(HIDDEN_LAYER, NUM_ACT, requires_grad=True)
 
+class PolicyNetwork(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.ln1 = torch.nn.Linear(NUM_OBS, HIDDEN_LAYER)
+        self.ln2 = torch.nn.Linear(HIDDEN_LAYER, NUM_ACT)
+        self.soft = torch.nn.Softmax(dim=-1)
+        self.act = torch.nn.ReLU()
+    
+    def forward(self, x) -> torch.Tensor:
+        x = self.act(self.ln1(x))
+        x = self.soft(self.ln2(x))
+        return x
 
-def softmax(x):
-    z = torch.max(x, axis=-1, keepdims=True).values
-    return torch.exp(x - z) / torch.sum(torch.exp(x - z), axis=-1, keepdims=True)
-
-
-def relu(x):
-    a = torch.maximum(x, torch.zeros_like(x))
-    return a
+model = PolicyNetwork()
+optimizer = torch.optim.RMSprop(model.parameters(), lr=LR)
 
 
 def discount_Rt(rewards):
@@ -45,24 +42,8 @@ def discount_Rt(rewards):
     return rewards.reshape(1, t) @ mask
 
 
-def rmsprop_update(grads):
-    param_update = {}
-    for k, grad in grads.items():
-        rmsprop_cache[k] = BETA * rmsprop_cache[k] + (1 - BETA) * grad**2
-        param_update[k] = (LR / torch.sqrt(rmsprop_cache[k] + EPS)) * grad
-    return param_update
-
-
-def policy_forward(St):
-    z1 = St @ model["W1"]
-    a1 = relu(z1)
-    z2 = a1 @ model["W2"]
-    a2 = softmax(z2)
-
-    return a2
-
 def policy_backward(A, S, R, t, rets):
-    probs = policy_forward(S)
+    probs = model(S)
 
     Gt = discount_Rt(R)
     baseline = torch.mean(torch.tensor(rets), dtype=torch.float32)
@@ -87,7 +68,7 @@ def main():
         A, S, R = [], [], []
 
         while not done:
-            p = policy_forward(St).squeeze(axis=0)
+            p = model(St).squeeze(axis=0)
             S.append(St)
 
             At = np.random.choice(np.arange(NUM_ACT), p=p.detach().numpy())
@@ -102,17 +83,12 @@ def main():
 
         A, S, R = torch.stack(A), torch.stack(S), torch.stack(R)
         J = policy_backward(A, S, R, t, rets)
-        J.backward()
 
         # we need to divide by t because we want to MEAN, since grads are all accumulated with sum
-        param_update = rmsprop_update({ 
-            "dJdW1": model["W1"].grad / t,
-            "dJdW2": model["W2"].grad / t
-        })
-
+        optimizer.zero_grad()
+        J.backward()
         with torch.no_grad():
-            model["W1"] -= param_update["dJdW1"]
-            model["W2"] -= param_update["dJdW2"]
+            optimizer.step()
 
         costs.append(J)
         rets.append(torch.sum(R))
