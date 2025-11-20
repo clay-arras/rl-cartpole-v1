@@ -112,7 +112,7 @@ def main():
             p = policy_forward(St)
             S.append(St)
 
-            At = np.random.choice([a for a in range(NUM_ACT)], p=p)
+            At = np.random.choice(np.arange(NUM_ACT), p=p)
             St, Rt, term, trunc, info = env.step(At)
             St = St.reshape(1, NUM_OBS)
 
