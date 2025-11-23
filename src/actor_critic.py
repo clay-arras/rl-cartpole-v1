@@ -4,7 +4,7 @@ import numpy as np
 from base_policy import _BasePolicy
 
 
-class _PolicyGradientNetwork(torch.nn.Module):
+class _BasePolicyNetwork(torch.nn.Module):
     def __init__(self, num_obs: int, num_act: int, hidden_layer: int = 64) -> None:
         super().__init__()
         self.ln1 = torch.nn.Linear(num_obs, hidden_layer)
@@ -18,48 +18,41 @@ class _PolicyGradientNetwork(torch.nn.Module):
         return x
 
 
-class PolicyGradient(_BasePolicy):
+class ActorCritic(_BasePolicy):
     def __init__(
         self, env: gym.Env, disc_gamma=0.99, learning_rate=5e-4, save_interval=int(5e2)
     ) -> None:
         super().__init__(env)
-
-        self.model = _PolicyGradientNetwork(
-            num_obs=self.obs_space, num_act=self.act_space
-        )
-        self.optimizer = torch.optim.RMSprop(self.model.parameters(), lr=learning_rate)
+        self.actor = _BasePolicyNetwork(self.obs_space, self.act_space)
+        self.critic = _BasePolicyNetwork(self.obs_space + self.act_space, 1)
+        self.optimizer = torch.optim.RMSprop(self.actor.parameters(), lr=learning_rate)
 
         self.learning_rate = learning_rate
         self.disc_gamma = disc_gamma
         self.save_interval = save_interval
 
-    def _discount_rewards(self, rewards: torch.Tensor) -> torch.Tensor:
-        t = rewards.shape[-1]
-        assert rewards.shape == (t,)
-        pows = torch.arange(t)
-        mask = torch.tril(
-            torch.outer(
-                torch.pow(self.disc_gamma, pows), torch.pow(self.disc_gamma, -pows)
-            )
-        )
-        return rewards.reshape(1, t) @ mask
+    def _loss_policy(self, At, St) -> torch.Tensor:  # At, St, Rt, Qw_sa
+        """
+        St is (1, obs_space)
+        At is (1,)
 
-    def _loss(self, A, S, R, rets) -> torch.Tensor:
-        t = A.shape[0]
-
-        ret = self._discount_rewards(R)
-        baseline = torch.mean(torch.tensor(rets), dtype=torch.float32)
-        adv = ret - baseline
-        adv = adv.reshape(t, 1, 1)
-
+        change:
+        - loss needs to update every TIMESTEP instead of at the end of each episode
+        - discounted rewards is replaced by the values.
+        """
         oh_A = (
-            torch.unsqueeze(A, axis=1)
+            torch.unsqueeze(At, axis=1)
             == torch.unsqueeze(torch.arange(self.act_space), axis=0)
         ).int()
-        oh_A = oh_A.reshape(t, 1, self.act_space)
+        assert oh_A.shape == (1, self.act_space)
 
-        probs = self.model(S)
-        J = -torch.sum(adv * oh_A * torch.log(probs + 1e-8))
+        prob = self.actor(St)
+        adv = self.critic(torch.cat([St, oh_A], axis=-1))
+        J = -torch.sum(adv * oh_A * torch.log(prob + 1e-8))
+        return J
+
+    def _loss_value(self, Rt, val_prev, val_curr) -> torch.Tensor:
+        J = -torch.sum(val_prev, Rt + self.disc_gamma * val_curr)
         return J
 
     def learn(self, t: int) -> None:
@@ -102,9 +95,9 @@ class PolicyGradient(_BasePolicy):
                 )
         self.env.close()
 
-    def predict(self, St: np.ndarray) -> int:
-        St = torch.tensor(St.reshape(1, self.obs_space))
-        p = self.model(St).squeeze(axis=0)
+    # def predict(self, St: np.ndarray) -> int:
+    #     St = torch.tensor(St.reshape(1, self.obs_space))
+    #     p = self.model(St).squeeze(axis=0)
 
-        At = np.random.choice(np.arange(self.act_space), p=p.detach().numpy())
-        return At
+    #     At = np.random.choice(np.arange(self.act_space), p=p.detach().numpy())
+    #     return At
