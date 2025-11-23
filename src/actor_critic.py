@@ -1,25 +1,36 @@
 from src.base_policy import _BasePolicy
 
 import torch
+from jaxtyping import Float, Int, jaxtyped
+from typeguard import typechecked as typechecker
 import gymnasium as gym
 import numpy as np
 
-# from base_policy import _BasePolicy
 
-torch.autograd.set_detect_anomaly(True)
-
-
-class _BasePolicyNetwork(torch.nn.Module):
-    def __init__(self, num_obs: int, num_act: int, hidden_layer: int = 64) -> None:
+class _BasePolicyClassifierNetwork(torch.nn.Module):
+    def __init__(self, nin: int, nout: int, hidden_layer: int = 64) -> None:
         super().__init__()
-        self.ln1 = torch.nn.Linear(num_obs, hidden_layer)
-        self.ln2 = torch.nn.Linear(hidden_layer, num_act)
+        self.ln1 = torch.nn.Linear(nin, hidden_layer)
+        self.ln2 = torch.nn.Linear(hidden_layer, nout)
         self.soft = torch.nn.Softmax(dim=-1)
         self.act = torch.nn.ReLU()
 
     def forward(self, x) -> torch.Tensor:
         x = self.act(self.ln1(x))
         x = self.soft(self.ln2(x))
+        return x
+
+
+class _BasePolicyRegressionNetwork(torch.nn.Module):
+    def __init__(self, nin: int, nout: int, hidden_layer: int = 64) -> None:
+        super().__init__()
+        self.ln1 = torch.nn.Linear(nin, hidden_layer)
+        self.ln2 = torch.nn.Linear(hidden_layer, nout)
+        self.act = torch.nn.ReLU()
+
+    def forward(self, x) -> torch.Tensor:
+        x = self.act(self.ln1(x))
+        x = self.ln2(x)
         return x
 
 
@@ -31,8 +42,8 @@ class ActorCritic(_BasePolicy):
         self.obs_space = np.prod(self.env.observation_space.shape)
         self.act_space = self.env.action_space.n
 
-        self.actor = _BasePolicyNetwork(self.obs_space, self.act_space)
-        self.critic = _BasePolicyNetwork(self.obs_space + self.act_space, 1)
+        self.actor = _BasePolicyClassifierNetwork(self.obs_space, self.act_space)
+        self.critic = _BasePolicyRegressionNetwork(self.obs_space, 1)
         self.actor_optimizer = torch.optim.RMSprop(
             self.actor.parameters(), lr=learning_rate
         )
@@ -44,81 +55,137 @@ class ActorCritic(_BasePolicy):
         self.disc_gamma = disc_gamma
         self.save_interval = save_interval
 
-    def _loss_policy(self, At, St, Q_sa) -> torch.Tensor:  # At, St, Rt, Qw_sa
-        oh_A = (
-            torch.tensor(At) == torch.unsqueeze(torch.arange(self.act_space), axis=0)
-        ).int()
-        assert oh_A.shape == (1, self.act_space)
+    @jaxtyped(typechecker=typechecker)
+    def _loss_policy(
+        self,
+        adV: Float[torch.Tensor, "1"],
+        At: Int[torch.Tensor, "1"],
+        St: Float[torch.Tensor, "1 obs_space"],
+    ) -> Float[torch.Tensor, "1"]:
+        """
+        description: this is the loss calculation for the policy,
+        calculated by the sum of -ohA_t V log(policy(St)).
+        - ohA_t is (act_space,) and represents one-hot encoded action
+        - adV is (1,) and represents the advantage given by the critic,
+          consisting of Rt + gamma V(St+1) - V(St)
+        - policy(St) is (act_space,)
 
-        prob = self.actor(St)
-        J = -torch.sum(Q_sa * oh_A * torch.log(prob + 1e-8))
-        return J
+        inputs:
+        - adV is (1,) and represents Rt + gamma V(St+1) - V(St), aka the
+          estimated reward / advantage given the state. should NOT be gradient
+          tracked
+        - At is (1,) and represents the action taken at timestep t
+        - St is (1, obs_space) and represents the state at timestep t
 
-    def _loss_value(self, Rt, val_prev, val_curr) -> torch.Tensor:
-        # J = -torch.sum((Rt + self.disc_gamma * val_curr - val_prev)**2)
-        J = torch.nn.MSELoss()(val_prev, Rt + self.disc_gamma * val_curr)
-        return J
+        outputs:
+        - J is (1,) and represents the cost tensor
+        """
+        ohA_t = torch.nn.functional.one_hot(At, num_classes=self.act_space)
+        assert isinstance(ohA_t, Int[torch.Tensor, "1 act_space"])
+        policy_St = self.actor(St)
+        assert isinstance(policy_St, Float[torch.Tensor, "1 act_space"])
+        J = -torch.sum(ohA_t * adV * torch.log(policy_St + 1e-8))
+        return J.reshape(1)
+
+    @jaxtyped(typechecker=typechecker)
+    def _loss_value(
+        self,
+        V_prev: Float[torch.Tensor, "1"],
+        V_curr: Float[torch.Tensor, "1"],
+        Rt: float,
+    ) -> Float[torch.Tensor, "1"]:
+        """
+        description: this should use MSE, where the actual value is estimated
+        to be (gamma * V(St+1) + Rt), and predicted value is V(St)
+
+        inputs:
+        - V_prev is (1,) and represents V(St). this tensor is what we are
+          backpropogating over, similar to y_pred
+        - V_curr is (1,) and represents V(St+1). this tensor should not be
+          gradient tracked and should be detached. treat this like y_actual
+        - Rt is (1,) and represents the reward gotten from the environment
+
+        outputs:
+        - J is (1,) and represents a cost tensor
+        """
+        loss_fn = torch.nn.MSELoss()
+        J = loss_fn(V_prev, self.disc_gamma * V_curr + Rt)
+        return J.reshape(1)
 
     def learn(self, t: int) -> None:
-        rets, costs = [1], [1]
-        for i in range(t):
+        """
+        description:
+        inside the training loop for each episode, it needs to do the following
+        - get action probabilities from actor net
+        - sample At from action probabilities
+        - sample St+1, Rt from the environment
+        - get V(St+1) from critic net
+        - update the actor weights
+        - update the critic weights
+        - store V_prev as V(St+1)
+
+        inputs:
+        - t is an int representing the number of timesteps to take
+
+        outputs: None
+        """
+        rets = []
+        for timestep in range(t):
             St, _ = self.env.reset()
             St = torch.tensor(St.reshape(1, self.obs_space))
 
             done = False
-            J, R = [], []
-            prev_Qsa = None
+            St_prev = None
+            R = []
 
             while not done:
-                p = self.actor(St).squeeze(axis=0)
+                logits = self.actor(St)
+                assert isinstance(logits, Float[torch.Tensor, "1 act_space"])
+                mnom = torch.distributions.categorical.Categorical(probs=logits)
+                At = mnom.sample()
+                assert isinstance(At, Int[torch.Tensor, "1"])
 
-                At = np.random.choice(np.arange(self.act_space), p=p.detach().numpy())
-                St, Rt, term, trunc, _ = self.env.step(At)
+                St, Rt, term, trunc, _ = self.env.step(
+                    At.detach().item()
+                )  # .numpy() instead of .item()?
                 St = torch.tensor(St.reshape(1, self.obs_space))
+                assert isinstance(St, Float[torch.Tensor, "1 obs_space"])
 
-                oh_A = (
-                    torch.tensor(At)
-                    == torch.unsqueeze(torch.arange(self.act_space), axis=0)
-                ).int()
-                assert oh_A.shape == (1, self.act_space)
-                Q_sa = self.critic(torch.cat([St, oh_A], axis=-1))
-                Jt = self._loss_policy(At, St, Q_sa.detach())
+                if St_prev is not None:
+                    V_curr = self.critic(St).reshape(
+                        1,
+                    )
+                    assert isinstance(V_curr, Float[torch.Tensor, "1"])
+                    V_prev = self.critic(St_prev).reshape(
+                        1,
+                    )
+                    assert isinstance(V_prev, Float[torch.Tensor, "1"])
+                    adV = Rt + self.disc_gamma * V_curr.detach() - V_prev.detach()
 
-                self.actor_optimizer.zero_grad()
-                Jt.backward()
-                with torch.no_grad():
+                    aJ = self._loss_policy(adV, At, St_prev)
+                    self.actor_optimizer.zero_grad()
+                    aJ.backward()
                     self.actor_optimizer.step()
 
-                if prev_Qsa:
+                    cJ = self._loss_value(V_prev, V_curr, Rt)
                     self.critic_optimizer.zero_grad()
-                    cJt = self._loss_value(Rt, prev_Qsa, Q_sa.detach())
-                    cJt.backward()
-                    with torch.no_grad():
-                        self.critic_optimizer.step()
+                    cJ.backward()
+                    self.critic_optimizer.step()
 
+                St_prev = St.detach()
                 R.append(torch.tensor(Rt))
-                J.append(torch.tensor(Jt.detach()))
-                prev_Qsa = self.critic(torch.cat([St, oh_A], axis=-1))
-
                 done = term or trunc
 
-            costs.append(torch.mean(torch.stack(J)))
             rets.append(torch.sum(torch.stack(R)))
-            if i % self.save_interval == 0:
+            if timestep % self.save_interval == 0:
                 print(
-                    "cost: ",
-                    torch.mean(torch.tensor(costs[-self.save_interval :])),
                     "avg_ret: ",
                     torch.mean(torch.tensor(rets[-self.save_interval :])),
                 )
         self.env.close()
 
-    # def predict(self, St: np.ndarray) -> int:
-    #     St = torch.tensor(St.reshape(1, self.obs_space))
-    #     p = self.model(St).squeeze(axis=0)
-
-    #     At = np.random.choice(np.arange(self.act_space), p=p.detach().numpy())
-    #     return At
+    def predict(self) -> int:
+        pass
 
 
 if __name__ == "__main__":
