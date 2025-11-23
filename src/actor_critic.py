@@ -1,7 +1,12 @@
+from src.base_policy import _BasePolicy
+
 import torch
 import gymnasium as gym
 import numpy as np
-from base_policy import _BasePolicy
+
+# from base_policy import _BasePolicy
+
+torch.autograd.set_detect_anomaly(True)
 
 
 class _BasePolicyNetwork(torch.nn.Module):
@@ -23,36 +28,35 @@ class ActorCritic(_BasePolicy):
         self, env: gym.Env, disc_gamma=0.99, learning_rate=5e-4, save_interval=int(5e2)
     ) -> None:
         super().__init__(env)
+        self.obs_space = np.prod(self.env.observation_space.shape)
+        self.act_space = self.env.action_space.n
+
         self.actor = _BasePolicyNetwork(self.obs_space, self.act_space)
         self.critic = _BasePolicyNetwork(self.obs_space + self.act_space, 1)
-        self.optimizer = torch.optim.RMSprop(self.actor.parameters(), lr=learning_rate)
+        self.actor_optimizer = torch.optim.RMSprop(
+            self.actor.parameters(), lr=learning_rate
+        )
+        self.critic_optimizer = torch.optim.RMSprop(
+            self.critic.parameters(), lr=learning_rate
+        )
 
         self.learning_rate = learning_rate
         self.disc_gamma = disc_gamma
         self.save_interval = save_interval
 
-    def _loss_policy(self, At, St) -> torch.Tensor:  # At, St, Rt, Qw_sa
-        """
-        St is (1, obs_space)
-        At is (1,)
-
-        change:
-        - loss needs to update every TIMESTEP instead of at the end of each episode
-        - discounted rewards is replaced by the values.
-        """
+    def _loss_policy(self, At, St, Q_sa) -> torch.Tensor:  # At, St, Rt, Qw_sa
         oh_A = (
-            torch.unsqueeze(At, axis=1)
-            == torch.unsqueeze(torch.arange(self.act_space), axis=0)
+            torch.tensor(At) == torch.unsqueeze(torch.arange(self.act_space), axis=0)
         ).int()
         assert oh_A.shape == (1, self.act_space)
 
         prob = self.actor(St)
-        adv = self.critic(torch.cat([St, oh_A], axis=-1))
-        J = -torch.sum(adv * oh_A * torch.log(prob + 1e-8))
+        J = -torch.sum(Q_sa * oh_A * torch.log(prob + 1e-8))
         return J
 
     def _loss_value(self, Rt, val_prev, val_curr) -> torch.Tensor:
-        J = -torch.sum(val_prev, Rt + self.disc_gamma * val_curr)
+        # J = -torch.sum((Rt + self.disc_gamma * val_curr - val_prev)**2)
+        J = torch.nn.MSELoss()(val_prev, Rt + self.disc_gamma * val_curr)
         return J
 
     def learn(self, t: int) -> None:
@@ -62,30 +66,44 @@ class ActorCritic(_BasePolicy):
             St = torch.tensor(St.reshape(1, self.obs_space))
 
             done = False
-            A, S, R = [], [], []
+            J, R = [], []
+            prev_Qsa = None
 
             while not done:
-                p = self.model(St).squeeze(axis=0)
-                S.append(St)
+                p = self.actor(St).squeeze(axis=0)
 
                 At = np.random.choice(np.arange(self.act_space), p=p.detach().numpy())
                 St, Rt, term, trunc, _ = self.env.step(At)
                 St = torch.tensor(St.reshape(1, self.obs_space))
 
-                A.append(torch.tensor(At))
+                oh_A = (
+                    torch.tensor(At)
+                    == torch.unsqueeze(torch.arange(self.act_space), axis=0)
+                ).int()
+                assert oh_A.shape == (1, self.act_space)
+                Q_sa = self.critic(torch.cat([St, oh_A], axis=-1))
+                Jt = self._loss_policy(At, St, Q_sa.detach())
+
+                self.actor_optimizer.zero_grad()
+                Jt.backward()
+                with torch.no_grad():
+                    self.actor_optimizer.step()
+
+                if prev_Qsa:
+                    self.critic_optimizer.zero_grad()
+                    cJt = self._loss_value(Rt, prev_Qsa, Q_sa.detach())
+                    cJt.backward()
+                    with torch.no_grad():
+                        self.critic_optimizer.step()
+
                 R.append(torch.tensor(Rt))
+                J.append(torch.tensor(Jt.detach()))
+                prev_Qsa = self.critic(torch.cat([St, oh_A], axis=-1))
+
                 done = term or trunc
 
-            A, S, R = torch.stack(A), torch.stack(S), torch.stack(R)
-            J = self._loss(A, S, R, rets[-self.save_interval :])
-
-            self.optimizer.zero_grad()
-            J.backward()
-            with torch.no_grad():
-                self.optimizer.step()
-
-            costs.append(J)
-            rets.append(torch.sum(R))
+            costs.append(torch.mean(torch.stack(J)))
+            rets.append(torch.sum(torch.stack(R)))
             if i % self.save_interval == 0:
                 print(
                     "cost: ",
@@ -101,3 +119,10 @@ class ActorCritic(_BasePolicy):
 
     #     At = np.random.choice(np.arange(self.act_space), p=p.detach().numpy())
     #     return At
+
+
+if __name__ == "__main__":
+    env = gym.make("CartPole-v1")
+    policy = ActorCritic(env)
+
+    policy.learn(10000)
