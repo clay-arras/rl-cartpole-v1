@@ -3,7 +3,6 @@ import gymnasium as gym
 import numpy as np
 from base_policy import _BasePolicy
 
-
 class _PolicyGradientNetwork(torch.nn.Module):
     def __init__(self, num_obs: int, num_act: int, hidden_layer: int = 64) -> None:
         super().__init__()
@@ -11,21 +10,21 @@ class _PolicyGradientNetwork(torch.nn.Module):
         self.ln2 = torch.nn.Linear(hidden_layer, num_act)
         self.soft = torch.nn.Softmax(dim=-1)
         self.act = torch.nn.ReLU()
-
+    
     def forward(self, x) -> torch.Tensor:
         x = self.act(self.ln1(x))
         x = self.soft(self.ln2(x))
         return x
 
-
 class PolicyGradient(_BasePolicy):
-    def __init__(
-        self, env: gym.Env, disc_gamma=0.99, learning_rate=5e-4, save_interval=int(5e2)
-    ) -> None:
+    def __init__(self, env: gym.Env, disc_gamma=0.99, learning_rate=5e-4, save_interval=int(5e2)) -> None:
         super().__init__(env)
+        self.obs_space = np.prod(self.env.observation_space.shape)
+        self.act_space = self.env.action_space.n
 
         self.model = _PolicyGradientNetwork(
-            num_obs=self.obs_space, num_act=self.act_space
+            num_obs=self.obs_space,
+            num_act=self.act_space
         )
         self.optimizer = torch.optim.RMSprop(self.model.parameters(), lr=learning_rate)
 
@@ -84,7 +83,7 @@ class PolicyGradient(_BasePolicy):
                 done = term or trunc
 
             A, S, R = torch.stack(A), torch.stack(S), torch.stack(R)
-            J = self._loss(A, S, R, rets[-self.save_interval :])
+            J = self._loss(A, S, R, rets[-self.save_interval:])
 
             self.optimizer.zero_grad()
             J.backward()
@@ -96,9 +95,9 @@ class PolicyGradient(_BasePolicy):
             if i % self.save_interval == 0:
                 print(
                     "cost: ",
-                    torch.mean(torch.tensor(costs[-self.save_interval :])),
+                    torch.mean(torch.tensor(costs[-self.save_interval:])),
                     "avg_ret: ",
-                    torch.mean(torch.tensor(rets[-self.save_interval :])),
+                    torch.mean(torch.tensor(rets[-self.save_interval:])),
                 )
         self.env.close()
 
